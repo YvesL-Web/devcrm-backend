@@ -3,6 +3,7 @@ import { z } from 'zod'
 import { AppDataSource } from '../config/data-source.js'
 import { Client } from '../entities/Client.js'
 import { Invoice, InvoiceItem } from '../entities/Invoice.js'
+import { InvoiceCounter } from '../entities/InvoiceCounter.js'
 import { Organization } from '../entities/Organization.js'
 import { Project } from '../entities/Project.js'
 import {
@@ -65,6 +66,7 @@ const itemSchema = z.object({
   unitPrice: z.coerce.number().min(0),
   sortOrder: z.coerce.number().int().min(0).optional()
 })
+
 const upsertSchema = z.object({
   number: z.string().min(1).max(40),
   currency: z.string().length(3).default('USD'),
@@ -120,36 +122,49 @@ router.post(
     const invRepo = AppDataSource.getRepository(Invoice)
     const itemRepo = AppDataSource.getRepository(InvoiceItem)
 
-    const inv = invRepo.create({
-      orgId,
-      number: body.number.trim(),
-      currency: body.currency.toUpperCase(),
-      issueDate: body.issueDate,
-      dueDate: body.dueDate ?? null,
-      status: body.status,
-      clientId: body.clientId ?? null,
-      projectId: body.projectId ?? null,
-      subtotal: totals.subtotal.toFixed(2),
-      tax: totals.tax.toFixed(2),
-      total: totals.total.toFixed(2),
-      notes: body.notes?.trim() || null,
-      terms: body.terms?.trim() || null
-    })
-    await invRepo.save(inv)
+    let number = body.number.trim()
+    const prefix = 'INV' // rendre configurable plus tard !
 
-    const items = body.items.map((it, idx) =>
-      itemRepo.create({
-        invoiceId: inv.id,
-        description: it.description.trim(),
-        quantity: it.quantity.toFixed(2),
-        unitPrice: it.unitPrice.toFixed(2),
-        amount: (it.quantity * it.unitPrice).toFixed(2),
-        sortOrder: it.sortOrder ?? idx
+    const created = await AppDataSource.transaction(async (manager) => {
+      if (!number) {
+        // generate next number with lock
+        number = await generateNextInvoiceNumberAtomic(orgId, manager, prefix)
+      }
+      const inv = invRepo.create({
+        orgId,
+        number: number!,
+        currency: body.currency.toUpperCase(),
+        issueDate: body.issueDate,
+        dueDate: body.dueDate ?? null,
+        status: body.status,
+        clientId: body.clientId ?? null,
+        projectId: body.projectId ?? null,
+        subtotal: totals.subtotal.toFixed(2),
+        tax: totals.tax.toFixed(2),
+        total: totals.total.toFixed(2),
+        notes: body.notes?.trim() || null,
+        terms: body.terms?.trim() || null
       })
-    )
-    await itemRepo.save(items)
+      await manager.getRepository(Invoice).save(inv)
 
-    const withItems = await invRepo.findOne({ where: { id: inv.id }, relations: { items: true } })
+      const items = body.items.map((it, idx) =>
+        manager.getRepository(InvoiceItem).create({
+          invoiceId: inv.id,
+          description: it.description.trim(),
+          quantity: it.quantity.toFixed(2),
+          unitPrice: it.unitPrice.toFixed(2),
+          amount: (it.quantity * it.unitPrice).toFixed(2),
+          sortOrder: it.sortOrder ?? idx
+        })
+      )
+      await manager.getRepository(InvoiceItem).save(items)
+      return inv
+    })
+
+    const withItems = await invRepo.findOne({
+      where: { id: created.id },
+      relations: { items: true }
+    })
     res.status(201).json(withItems)
   })
 )
@@ -354,4 +369,57 @@ router.post(
   })
 )
 
+/** PREVIEW next number (no reservation) */
+router.get(
+  '/next-number',
+  requireAuth,
+  requireVerifyEmail,
+  requireOrg,
+  asyncHandler(async (req, res) => {
+    const orgId = (req as any).orgId as string
+    const prefix = String(req.query.prefix || 'INV')
+      .trim()
+      .toUpperCase()
+      .slice(0, 10)
+    const year = new Date().getFullYear()
+
+    // lecture simple (sans lock) -> preview
+    const repo = AppDataSource.getRepository(InvoiceCounter)
+    const row = await repo.findOne({ where: { orgId, year } })
+    const next = (row?.lastNumber || 0) + 1
+    res.json({ preview: formatInvoiceNumber(prefix, year, next) })
+  })
+)
+
 export default router
+
+function formatInvoiceNumber(prefix: string, year: number, n: number) {
+  return `${prefix}-${year}-${String(n).padStart(4, '0')}`
+}
+
+async function generateNextInvoiceNumberAtomic(orgId: string, manager: any, prefix = 'INV') {
+  const year = new Date().getFullYear()
+  const repo = manager.getRepository(InvoiceCounter)
+
+  // Essaie de locker la ligne existante
+  let counter = await repo
+    .createQueryBuilder('c')
+    .where('c.orgId = :orgId AND c.year = :year', { orgId, year })
+    .setLock('pessimistic_write')
+    .getOne()
+
+  if (!counter) {
+    // crée la ligne si absente puis relock
+    await repo.insert({ orgId, year, lastNumber: 0 })
+    counter = await repo
+      .createQueryBuilder('c')
+      .where('c.orgId = :orgId AND c.year = :year', { orgId, year })
+      .setLock('pessimistic_write')
+      .getOne()
+  }
+
+  const next = (counter!.lastNumber || 0) + 1
+  counter!.lastNumber = next
+  await repo.save(counter!)
+  return formatInvoiceNumber(prefix, year, next)
+}

@@ -5,15 +5,14 @@ import {
   Index,
   JoinColumn,
   ManyToOne,
-  PrimaryGeneratedColumn,
-  UpdateDateColumn
+  PrimaryGeneratedColumn
 } from 'typeorm'
 import { Task } from './Task.js'
 import { User } from './User.js'
 
 @Entity()
 @Index(['taskId', 'createdAt'])
-export class TaskComment {
+export class TaskAttachment {
   @PrimaryGeneratedColumn('uuid')
   id!: string
 
@@ -28,21 +27,24 @@ export class TaskComment {
   task!: Task
 
   @Column('uuid')
-  authorId!: string
+  uploaderId!: string
 
   @ManyToOne(() => User, () => undefined, { onDelete: 'SET NULL', nullable: true })
-  @JoinColumn({ name: 'authorId' })
-  author?: User | null
+  @JoinColumn({ name: 'uploaderId' })
+  uploader?: User | null
 
-  @Column({ type: 'text' })
-  body!: string // markdown/plain
+  @Column({ type: 'varchar', length: 300 })
+  filename!: string
+
+  @Column({ type: 'varchar', length: 150 })
+  mimeType!: string
+
+  @Column({ type: 'bigint' })
+  size!: string
+
+  @Column({ type: 'varchar', length: 500 })
+  storageKey!: string
 
   @CreateDateColumn()
   createdAt!: Date
-
-  @UpdateDateColumn()
-  updatedAt!: Date
-
-  @Column({ type: 'timestamp', nullable: true })
-  editedAt!: Date | null
 }

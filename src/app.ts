@@ -10,14 +10,14 @@ import authRoutes from './routes/auth'
 import billing from './routes/billing'
 import clientRoutes from './routes/clients'
 import debugRoutes from './routes/debug'
-import integrationRoutes from './routes/integrations'
 import invoiceRoutes from './routes/invoices'
 import orgRoutes from './routes/orgs'
 import portalRoutes from './routes/portal'
 import projectRoutes from './routes/projects'
 import releaseRoutes from './routes/releases'
+import taskAttachmentsRoutes from './routes/taskAttachments'
+import taskCommentsRoutes from './routes/taskComments'
 import taskRoutes from './routes/tasks'
-import timeRoutes from './routes/time'
 
 import { env } from './config/env'
 
@@ -51,11 +51,10 @@ export const createApp = () => {
   app.use('/projects', projectRoutes)
   app.use('/releases', releaseRoutes)
   app.use('/tasks', taskRoutes)
+  app.use('/tasks', taskCommentsRoutes)
+  app.use('/tasks', taskAttachmentsRoutes)
   app.use('/portal', portalRoutes)
   app.use('/invoices', invoiceRoutes)
-  app.use('/', timeRoutes)
-  app.use('/', integrationRoutes)
-  app.use('/', billing.router)
 
   app.use('/_debug', debugRoutes)
 

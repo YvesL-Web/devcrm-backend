@@ -53,7 +53,9 @@ const EnvSchema = z.object({
   STRIPE_PRICE_TEAM_YEAR: z.string(),
   // Portal
   PORTAL_TOKEN_SECRET: z.string().default('insecure'),
-  PORTAL_TOKEN_TTL: z.string().default('30d') // 30 days
+  PORTAL_TOKEN_TTL: z.string().default('30d'), // 30 days
+  // Uploads
+  UPLOADS_DIR: z.string().default('./var/uploads') // moved to config/uploads.ts
 })
 
 export const env = EnvSchema.parse(process.env)

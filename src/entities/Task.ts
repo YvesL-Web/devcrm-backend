@@ -65,6 +65,9 @@ export class Task {
   @Column({ type: 'int', default: 0 })
   kanbanOrder!: number
 
+  @Column({ type: 'timestamp', nullable: true })
+  doneAt?: Date | null
+
   @CreateDateColumn()
   createdAt!: Date
 

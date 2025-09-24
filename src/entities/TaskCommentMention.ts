@@ -5,15 +5,15 @@ import {
   Index,
   JoinColumn,
   ManyToOne,
-  PrimaryGeneratedColumn,
-  UpdateDateColumn
+  PrimaryGeneratedColumn
 } from 'typeorm'
 import { Task } from './Task.js'
+import { TaskComment } from './TaskComment.js'
 import { User } from './User.js'
 
 @Entity()
-@Index(['taskId', 'createdAt'])
-export class TaskComment {
+@Index(['orgId', 'taskId'])
+export class TaskCommentMention {
   @PrimaryGeneratedColumn('uuid')
   id!: string
 
@@ -28,21 +28,22 @@ export class TaskComment {
   task!: Task
 
   @Column('uuid')
-  authorId!: string
+  commentId!: string
+
+  @ManyToOne(() => TaskComment, () => undefined, { onDelete: 'CASCADE' })
+  @JoinColumn({ name: 'commentId' })
+  comment!: TaskComment
+
+  @Column('uuid')
+  mentionedUserId!: string
 
   @ManyToOne(() => User, () => undefined, { onDelete: 'SET NULL', nullable: true })
-  @JoinColumn({ name: 'authorId' })
-  author?: User | null
-
-  @Column({ type: 'text' })
-  body!: string // markdown/plain
+  @JoinColumn({ name: 'mentionedUserId' })
+  mentionedUser?: User | null
 
   @CreateDateColumn()
   createdAt!: Date
 
-  @UpdateDateColumn()
-  updatedAt!: Date
-
   @Column({ type: 'timestamp', nullable: true })
-  editedAt!: Date | null
+  notifiedAt!: Date | null
 }

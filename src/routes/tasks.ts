@@ -4,7 +4,7 @@ import { z } from 'zod'
 import { AppDataSource } from '../config/data-source.js'
 import { Project } from '../entities/Project.js'
 import { Task } from '../entities/Task.js'
-import { TaskComment } from '../entities/TaskComment.js'
+import { TaskEvent } from '../entities/TaskEvent.js'
 import {
   requireAuth,
   requireOrg,
@@ -25,48 +25,40 @@ async function assertProjectInOrg(projectId: string, orgId: string) {
   if (!p) throw AppError.forbidden('Project not in your organization')
 }
 
-// ----- KANBAN REORDER -----
-const reorderSchema = z.object({
-  projectId: z.uuid(),
-  columns: z.object({
-    OPEN: z.array(z.uuid()),
-    IN_PROGRESS: z.array(z.uuid()),
-    DONE: z.array(z.uuid())
-  })
-})
-
 // -------- LIST --------
 const listQuery = z.object({
   projectId: z.uuid().optional(),
   status: z.enum(['OPEN', 'IN_PROGRESS', 'DONE']).optional(),
   q: z.string().optional(),
+  assigneeId: z.uuid().optional(),
+  label: z.string().max(60).optional(),
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(1).max(100).default(20),
   sort: z.enum(['createdAt', 'updatedAt', 'dueDate', 'priority', 'kanbanOrder']).optional(),
-  order: z.enum(['ASC', 'DESC']).default('DESC')
+  order: z.enum(['ASC', 'DESC']).default('ASC')
 })
 
 router.get(
   '/',
   requireAuth,
+  requireVerifyEmail,
   requireOrg,
   asyncHandler(async (req, res) => {
     const orgId = (req as any).orgId as string
-    const { projectId, status, q, page, pageSize, sort, order } = listQuery.parse(req.query)
+    const { projectId, status, q, assigneeId, label, page, pageSize, sort, order } =
+      listQuery.parse(req.query)
 
     const repo = AppDataSource.getRepository(Task)
     const qb = repo.createQueryBuilder('t').where('t.orgId = :orgId', { orgId })
 
-    if (projectId) {
-      await assertProjectInOrg(projectId, orgId)
-      qb.andWhere('t.projectId = :projectId', { projectId })
-    }
+    if (projectId) qb.andWhere('t.projectId = :projectId', { projectId })
     if (status) qb.andWhere('t.status = :status', { status })
-    // if (assigneeId) qb.andWhere('t.assigneeId = :assigneeId', { assigneeId })
     if (q) qb.andWhere('(t.title ILIKE :q OR t.description ILIKE :q)', { q: `%${q}%` })
+    if (assigneeId) qb.andWhere('t.assigneeId = :assigneeId', { assigneeId })
+    if (label) qb.andWhere(':label = ANY(t.labels)', { label })
 
     if (sort) qb.orderBy(`t.${sort}`, order)
-    else qb.orderBy('t.createdAt', 'DESC')
+    else qb.orderBy('t.kanbanOrder', 'ASC')
 
     const [rows, total] = await qb
       .skip((page - 1) * pageSize)
@@ -140,6 +132,18 @@ router.post(
       kanbanOrder: nextOrder
     })
     await repo.save(t)
+
+    // Event
+    await AppDataSource.getRepository(TaskEvent).save(
+      AppDataSource.getRepository(TaskEvent).create({
+        orgId: orgId,
+        taskId: t.id,
+        actorId: userId,
+        type: 'TASK_CREATED',
+        data: { title: t.title, priority: t.priority }
+      })
+    )
+
     res.status(201).json(t)
   })
 )
@@ -184,10 +188,12 @@ router.patch(
     const data = updateBody.parse(req.body)
 
     const repo = AppDataSource.getRepository(Task)
+    const events = AppDataSource.getRepository(TaskEvent)
+
     const t = await repo.findOne({ where: { id, orgId } })
     if (!t) throw AppError.notFound('Task not found')
 
-    // Gating assignee en FREE
+    // ---- Gating assignee en FREE (assigner à soi-même OK, à autrui => PRO mini)
     if (typeof data.assigneeId !== 'undefined') {
       const org = await getOrgOrThrow(orgId)
       const canAssignOthers = Capabilities.CAN_ASSIGN_OTHERS(org.plan as any)
@@ -196,34 +202,112 @@ router.patch(
       }
     }
 
-    const beforeStatus = t.status
-    Object.assign(t, data)
+    // ---- Capture avant/après (pour events + doneAt)
+    const before = {
+      status: t.status,
+      assigneeId: t.assigneeId,
+      title: t.title,
+      priority: t.priority,
+      dueDate: t.dueDate,
+      labels: t.labels
+    }
 
-    // si on permet de changer de project: vérifier appartenance
-    // if (data && (data as any).projectId && (data as any).projectId !== t.projectId) {
-    //   await assertProjectInOrg((data as any).projectId, orgId)
-    // }
-    // si colonne changée, pousse à la fin
-    if (data.status && data.status !== beforeStatus) {
+    // ---- Appliquer les champs simples
+    if (typeof data.title !== 'undefined') t.title = data.title
+    if (typeof data.description !== 'undefined') t.description = data.description
+    if (typeof data.priority !== 'undefined') t.priority = data.priority
+    if (typeof data.assigneeId !== 'undefined') t.assigneeId = data.assigneeId ?? null
+    if (typeof data.githubIssueUrl !== 'undefined') t.githubIssueUrl = data.githubIssueUrl ?? null
+    if (typeof data.dueDate !== 'undefined') t.dueDate = data.dueDate ?? null
+
+    // ---- Labels : l’entité utilise un tableau non-null => [] si null/undefined
+    if ('labels' in data) {
+      if (data.labels == null) {
+        t.labels = []
+      } else {
+        const uniq = Array.from(new Set(data.labels.map((s) => s.trim()).filter(Boolean)))
+        t.labels = uniq
+      }
+    }
+
+    // ---- Status + kanbanOrder + doneAt
+    type Status = 'OPEN' | 'IN_PROGRESS' | 'DONE'
+
+    const prevStatus: Status = t.status as Status
+    const nextStatus: Status = (data.status ?? t.status) as Status
+
+    if (typeof data.status !== 'undefined' && nextStatus !== prevStatus) {
+      t.status = nextStatus
+
+      // push à la fin de la nouvelle colonne
       const last = await repo
         .createQueryBuilder('x')
         .where('x.orgId = :orgId AND x.projectId = :projectId AND x.status = :status', {
           orgId,
           projectId: t.projectId,
-          status: t.status
+          status: nextStatus
         })
         .orderBy('x.kanbanOrder', 'DESC')
         .getOne()
       t.kanbanOrder = (last?.kanbanOrder ?? 0) + 1
+
+      // maintenir doneAt sans faire râler TS
+      if (nextStatus === 'DONE') {
+        t.doneAt = new Date()
+      } else if (prevStatus === 'DONE') {
+        t.doneAt = null
+      }
+
+      // Event: STATUS_CHANGED
+      await events.save(
+        events.create({
+          orgId,
+          taskId: t.id,
+          actorId: userId,
+          type: 'STATUS_CHANGED',
+          data: { from: prevStatus, to: nextStatus }
+        })
+      )
     }
 
-    if ('labels' in data) {
-      if (data.labels == null) {
-        t.labels = null
-      } else {
-        const uniq = Array.from(new Set(data.labels.map((s) => s.trim()).filter(Boolean)))
-        t.labels = uniq.length ? uniq : null
-      }
+    // ---- Event: ASSIGNEE_CHANGED
+    if (typeof data.assigneeId !== 'undefined' && data.assigneeId !== before.assigneeId) {
+      await events.save(
+        events.create({
+          orgId,
+          taskId: t.id,
+          actorId: userId,
+          type: 'ASSIGNEE_CHANGED',
+          data: { from: before.assigneeId, to: data.assigneeId ?? null }
+        })
+      )
+    }
+
+    // ---- Optionnel: TASK_UPDATED si d’autres champs ont changé
+    const otherChanged =
+      (typeof data.title !== 'undefined' && data.title !== before.title) ||
+      (typeof data.priority !== 'undefined' && data.priority !== before.priority) ||
+      (typeof data.dueDate !== 'undefined' &&
+        (data.dueDate ?? null) !== (before.dueDate ?? null)) ||
+      ('labels' in data &&
+        JSON.stringify(t.labels || []) !== JSON.stringify(before.labels || [])) ||
+      typeof data.description !== 'undefined'
+
+    if (otherChanged) {
+      await events.save(
+        events.create({
+          orgId,
+          taskId: t.id,
+          actorId: userId,
+          type: 'TASK_UPDATED',
+          data: {
+            title: t.title,
+            priority: t.priority,
+            dueDate: t.dueDate,
+            labels: t.labels
+          }
+        })
+      )
     }
 
     await repo.save(t)
@@ -252,44 +336,15 @@ router.delete(
   })
 )
 
-// -------- COMMENTS --------
-const commentBody = z.object({ body: z.string().min(1).max(10_000) })
-
-router.get(
-  '/:id/comments',
-  requireAuth,
-  requireOrg,
-  asyncHandler(async (req, res) => {
-    const orgId = (req as any).orgId as string
-    const id = req.params.id
-    const repo = AppDataSource.getRepository(TaskComment)
-    const comments = await repo.find({ where: { taskId: id, orgId }, order: { createdAt: 'ASC' } })
-    res.json({ rows: comments })
+// -------- KANBAN REORDER --------
+const reorderSchema = z.object({
+  projectId: z.uuid(),
+  columns: z.object({
+    OPEN: z.array(z.uuid()),
+    IN_PROGRESS: z.array(z.uuid()),
+    DONE: z.array(z.uuid())
   })
-)
-
-router.post(
-  '/:id/comments',
-  requireAuth,
-  requireVerifyEmail,
-  requireOrg,
-  asyncHandler(async (req, res) => {
-    const orgId = (req as any).orgId as string
-    const userId = (req as any).userId as string
-    const id = req.params.id
-    const { body } = commentBody.parse(req.body)
-    // (optionnel) vérifier que la task est bien dans l'org
-    const task = await AppDataSource.getRepository(Task).findOne({
-      where: { id: id, orgId: orgId }
-    })
-    if (!task) throw AppError.notFound('Task not found')
-
-    const repo = AppDataSource.getRepository(TaskComment)
-    const c = repo.create({ orgId, taskId: id, authorId: userId, body })
-    await repo.save(c)
-    res.status(201).json(c)
-  })
-)
+})
 
 router.patch(
   '/kanban/reorder',
@@ -333,3 +388,41 @@ router.patch(
 )
 
 export default router
+
+/** KANBAN reorder: body.updates: [{ id, status, kanbanOrder }] */
+// const reorderBody = z.object({
+//   updates: z.array(z.object({
+//     id: z.uuid(),
+//     status: z.enum(['OPEN', 'IN_PROGRESS', 'DONE']),
+//     kanbanOrder: z.number().int().min(0),
+//   })).min(1),
+//   projectId: z.string().uuid(),
+// })
+
+// router.patch(
+//   '/kanban/reorder',
+//   requireAuth, requireVerifyEmail, requireOrg, requireRoleAtLeast('MEMBER'),
+//   asyncHandler(async (req, res) => {
+//     const orgId = (req as any).orgId as string
+//     const { updates, projectId } = reorderBody.parse(req.body)
+//     const ids = updates.map(u => u.id)
+
+//     const repo = AppDataSource.getRepository(Task)
+//     const tasks = await repo.find({ where: { orgId, projectId, id: In(ids) } })
+//     const byId = new Map(tasks.map(t => [t.id, t]))
+
+//     for (const u of updates) {
+//       const t = byId.get(u.id)
+//       if (!t) continue
+//       const prev = t.status
+//       t.status = u.status
+//       t.kanbanOrder = u.kanbanOrder
+//       if (prev !== t.status) {
+//         if (t.status === 'DONE') t.doneAt = new Date()
+//         else if (prev === 'DONE' && t.status !== 'DONE') t.doneAt = null
+//       }
+//     }
+//     await repo.save([...byId.values()])
+//     res.json({ ok: true })
+//   })
+// )

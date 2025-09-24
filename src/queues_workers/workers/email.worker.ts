@@ -1,6 +1,7 @@
 import { Job, UnrecoverableError } from 'bullmq'
 import { env } from '../../config/env'
 import { sendEmailWithAttachment } from '../../emails/resend'
+import { commentMentionHTML, commentMentionText } from '../../emails/templates/commentMentionHTML'
 import {
   emailVerificationHTML,
   emailVerificationText
@@ -88,6 +89,41 @@ export const emailWorker = makeWorker('email', async (job: Job<any>) => {
           attachmentContentType: p.attachment.contentType || 'application/pdf'
         })
 
+        return { sent: true }
+      }
+
+      case 'sendCommentMention': {
+        const p = job.data as {
+          to: string
+          authorName: string
+          taskTitle: string
+          projectName?: string
+          commentBody: string
+          linkUrl?: string
+        }
+
+        const subject = p.projectName
+          ? `[${p.projectName}] You were mentioned on "${p.taskTitle}"`
+          : `You were mentioned on "${p.taskTitle}"`
+
+        const html = commentMentionHTML({
+          to: p.to,
+          authorName: p.authorName,
+          taskTitle: p.taskTitle,
+          projectName: p.projectName || '',
+          commentBody: p.commentBody,
+          linkUrl: p.linkUrl || ''
+        })
+
+        const text = commentMentionText({
+          to: p.to,
+          authorName: p.authorName,
+          taskTitle: p.taskTitle,
+          projectName: p.projectName || '',
+          commentBody: p.commentBody,
+          linkUrl: p.linkUrl || ''
+        })
+        await sendEmailWithAttachment({ to: p.to, subject, html, text })
         return { sent: true }
       }
 
